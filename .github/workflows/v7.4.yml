@@ -1,0 +1,538 @@
+###############################################################################
+# FDVU VALIDATOR V7.5 – REBOOTED CSV ENGINE (2026)
+# ------------------------------------------------
+# Forbedringer i V7.5:
+#  - Total omskrevet CSV-motor (BOM-safe, delimiter-auto, robust header-parsing)
+#  - Option 2 fallback: regex → fallback DokType via phrase matching
+#  - Full TFM-prefix stripping før parsing
+#  - Stabil funksjonslasting (Load-FdvuData alltid tilgjengelig)
+#  - Ingen hardkodet data (system, komponent, type → kun CSV)
+#  - Bedre feilmeldinger
+#  - GUI nederst
+###############################################################################
+
+Set-StrictMode -Version Latest
+
+#############################################
+### 1 — CSV ENGINE (REBOOTED)
+#############################################
+
+function Normalize-Text([string]$s) {
+    if (-not $s) { return $null }
+    $s = $s -replace [char]0xFEFF, ""     # Remove ZERO-WIDTH NO-BREAK SPACE (Excel)
+    $s = $s -replace "^\xEF\xBB\xBF", ""  # Remove UTF-8 BOM
+    $s = $s -replace [char]0x00A0, " "    # NBSP → space
+    $s = $s -replace '&nbsp;', " "
+    $s = $s.Trim()
+    return [regex]::Replace($s, '\s+', ' ')
+}
+
+function Import-CsvSmart([string]$Path) {
+    # Read full file as raw text first (handles BOM + weird encodings)
+    $raw = Get-Content -LiteralPath $Path -Encoding UTF8 -Raw
+
+    # Clean BOM if needed
+    $raw = $raw -replace "^\xEF\xBB\xBF", ""
+
+    # Use first line for delimiter detection
+    $header = ($raw -split "`r?`n")[0]
+
+    if ($header -match ";")  { $delim = ";" }
+    elseif ($header -match "`t") { $delim = "`t" }
+    else { $delim = "," }
+
+    # Write cleaned text to temp and import
+    $tmp = [System.IO.Path]::GetTempFileName()
+    [System.IO.File]::WriteAllText($tmp, $raw, [System.Text.UTF8Encoding]::new($false))
+
+    return Import-Csv -LiteralPath $tmp -Delimiter $delim -Encoding UTF8
+}
+
+#############################################
+### 2 — PARSE CSV → SYSTEM, KOMP, INFOTYPE, DOKTYPE
+#############################################
+
+function Load-FdvuData([string]$CsvPath) {
+
+    $rows = Import-CsvSmart -Path $CsvPath
+
+    $PA0702      = New-Object System.Collections.Hashtable ([System.StringComparer]::InvariantCultureIgnoreCase)
+    $PA0802      = New-Object System.Collections.Hashtable ([System.StringComparer]::InvariantCultureIgnoreCase)
+    $PA0802Alias = New-Object System.Collections.Hashtable ([System.StringComparer]::InvariantCultureIgnoreCase)
+
+    $InfoTypes = New-Object System.Collections.Hashtable ([System.StringComparer]::InvariantCultureIgnoreCase)
+    $DocTypes  = New-Object System.Collections.Hashtable ([System.StringComparer]::InvariantCultureIgnoreCase)
+    $Pairs     = New-Object System.Collections.Hashtable ([System.StringComparer]::InvariantCultureIgnoreCase)
+
+    foreach ($r in $rows) {
+
+        # Normalize fields
+        $Kode  = Normalize-Text ($r.Kode)
+        $Navn  = Normalize-Text ($r.Navn)
+        $IT    = Normalize-Text ($r.Informasjonstype ?? $r.InfoType)
+        $DT    = Normalize-Text ($r.Dokumenttype ?? $r.DokType)
+        $Alias = Normalize-Text ($r.Alias ?? $r.Aliases)
+
+        # --- A) SYSTEM (tresifret) ---
+        if ($Kode -match '^\d{3}$') {
+            if (-not $PA0702.ContainsKey($Kode)) { $PA0702[$Kode] = $Navn }
+        }
+
+        # --- B) KOMPONENT (2–3 bokstaver) ---
+        elseif ($Kode -match '^[A-Za-z]{2,3}$') {
+            $uc = $Kode.ToUpper()
+            if (-not $PA0802.ContainsKey($uc)) { $PA0802[$uc] = $Navn }
+
+            $alts = @()
+            if ($Navn) {
+                $alts += $Navn
+                $alts += ($Navn -split '\/|,') | % { Normalize-Text $_ } | ? { $_ }
+            }
+            if ($Alias) {
+                $alts += ($Alias -split ';|\||,') | % { Normalize-Text $_ } | ? { $_ }
+            }
+            $PA0802Alias[$uc] = ($alts | Select-Object -Unique)
+        }
+
+        # --- C) INFO/DOK PAR ---
+        if ($IT -and $DT) {
+            $InfoTypes[$IT] = $true
+            $DocTypes[$DT]  = $true
+
+            if (-not $Pairs.ContainsKey($IT)) {
+                $Pairs[$IT] =
+                    New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::InvariantCultureIgnoreCase)
+            }
+            [void]$Pairs[$IT].Add($DT)
+        }
+
+        # --- D) Enkelt Info/Dok uten par ---
+        elseif ($IT) { $InfoTypes[$IT] = $true }
+        elseif ($DT) { $DocTypes[$DT] = $true }
+    }
+
+    # System fallback 200–799 om ingen PA0702 var satt
+    $PA0702Range = New-Object System.Collections.Generic.HashSet[string]
+    if ($PA0702.Count -eq 0) {
+        foreach ($n in 200..799) { $PA0702Range.Add("{0:000}" -f $n) }
+    }
+
+    return @{
+        PA0702=$PA0702
+        PA0702Range=$PA0702Range
+        PA0802=$PA0802
+        PA0802Aliases=$PA0802Alias
+        InfoTypes=$InfoTypes
+        DocTypes=$DocTypes
+        Pairs=$Pairs
+    }
+}
+
+#############################################
+### 3 — PARSE FILNAVN + FALLBACK (OPTION 2)
+#############################################
+
+$StrictNameRegex =
+'^(\d{3})\.(\d{3})(?:-([A-Za-z]{2,3}\d{0,3}))?\s+([^\s]+)\s+([^\s]+)(?:\s+(.+))?$'
+
+function Parse-FileName([string]$baseName) {
+    if ($baseName -match $StrictNameRegex) {
+        return @{
+            System=$Matches[1]
+            Lopenr=$Matches[2]
+            KompCode=$Matches[3]
+            InfoType=$Matches[4]
+            DokType=$Matches[5]
+            Fritekst=$Matches[6]
+            Strict=$true
+        }
+    }
+
+    # Fallback – trekk ut første to tallsekvenser
+    if ($baseName -match '(\d{3})[^\d]+(\d{3})') {
+        return @{
+            System=$Matches[1]
+            Lopenr=$Matches[2]
+            KompCode=$null
+            InfoType=$null
+            DokType=$null
+            Fritekst=$null
+            Strict=$false
+        }
+    }
+
+    return @{
+        System=$null; Lopenr=$null; KompCode=$null; InfoType=$null; DokType=$null; Fritekst=$null; Strict=$false
+    }
+}
+
+function Escape-Phrase([string]$phrase) {
+    $pat = [regex]::Escape($phrase)
+    return "\b$pat\b"
+}
+
+function Detect-ComponentByAliases([string]$fileBase, [hashtable]$aliasMap) {
+    $matches = New-Object System.Collections.Generic.List[string]
+    foreach ($code in $aliasMap.Keys) {
+        foreach ($a in $aliasMap[$code]) {
+            if ([string]::IsNullOrWhiteSpace($a)) { continue }
+            $pattern = Escape-WordPattern $a
+            if ($fileBase -match $pattern) {
+                $matches.Add($code)
+                break
+            }
+        }
+    }
+    $unique = if ($matches.Count -eq 1) { $matches[0] } else { $null }
+    return @{ Matches=$matches; Unique=$unique }
+}
+
+function Find-FirstPhraseMatch([string]$text, [hashtable]$candidates) {
+    $best = $null
+    foreach ($k in $candidates.Keys) {
+        $pat = Escape-WordPattern $k
+        $m = [regex]::Match($text, $pat, "IgnoreCase")
+        if ($m.Success) {
+            if (-not $best -or $m.Index -lt $best.Index -or
+               ($m.Index -eq $best.Index -and $m.Length -gt $best.Length)) {
+                $best = @{
+                    Value  = $k
+                    Index  = $m.Index
+                    Length = $m.Length
+                }
+            }
+        }
+    }
+    return $best
+}
+
+#############################################
+### 4 — VALIDERINGSFUNKSJON (Option 2)
+#############################################
+
+function Validate-File([IO.FileInfo]$File, $data, [bool]$enforcePairs, [bool]$looseSystem) {
+
+    # 1. Fjern TFM-prefix
+    $baseRaw   = $File.BaseName
+    $baseClean = $baseRaw -replace '^[+]?([A-Za-z]{2,4})[-_=\s]+',''
+    $base      = $baseClean
+    $ext       = $File.Extension.TrimStart('.')
+
+    $p = Parse-FileName -baseName $base
+
+    $status = "OK"
+    $err    = New-Object System.Text.StringBuilder
+
+    # --- System ---
+    if (-not $p.System) {
+        $status="FEIL"; $err.Append("Mangler systemnummer. ") | Out-Null
+    }
+    else {
+        if ($data.PA0702.Count -gt 0) {
+            if (-not $data.PA0702.ContainsKey($p.System)) {
+                $status="FEIL"; $err.Append("Ugyldig systemnummer ($($p.System)). ") | Out-Null
+            }
+        }
+        elseif ($looseSystem -and -not $data.PA0702Range.Contains($p.System)) {
+            $status="FEIL"; $err.Append("System ikke innenfor 200–799. ") | Out-Null
+        }
+    }
+
+    # --- InfoType ---
+    if (-not $p.InfoType) {
+        $status="FEIL"; $err.Append("Mangler informasjonstype. ") | Out-Null
+    }
+    elseif (-not $data.InfoTypes.ContainsKey($p.InfoType)) {
+        $status="FEIL"; $err.Append("Ugyldig informasjonstype '$($p.InfoType)'. ") | Out-Null
+    }
+
+    # --- DokType (Option 2 fallback) ---
+    if ($p.DokType -and $data.DocTypes.ContainsKey($p.DokType)) {
+        $dokOK = $true
+    }
+    else {
+        # fallback: se etter DokType etter InfoType
+        $rest = $base
+        $rest = $rest -replace "^\Q$p.System\E\.\Q$p.Lopenr\E",""
+        if ($p.InfoType) { $rest = $rest -replace "^\s*\Q$p.InfoType\E","" }
+        $rest = $rest.Trim()
+
+        $hit = Find-FirstPhraseMatch -text $rest -candidates $data.DocTypes
+        if ($hit) {
+            $p.DokType = $hit.Value
+            $dokOK = $true
+            $after = $rest.Substring($hit.Index + $hit.Length).Trim()
+            if ($after) { $p.Fritekst = $after }
+        }
+        else {
+            $status="FEIL"; $err.Append("Mangler dokumenttype. ") | Out-Null
+        }
+    }
+
+    # --- Par-logikk ---
+    if ($enforcePairs -and $p.InfoType -and $p.DokType -and $data.Pairs.Count -gt 0) {
+        if ($data.Pairs.ContainsKey($p.InfoType)) {
+            if (-not $data.Pairs[$p.InfoType].Contains($p.DokType)) {
+                $status="FEIL"
+                $err.Append("Ugyldig InfoType–DokType-par: $($p.InfoType) $($p.DokType). ") | Out-Null
+            }
+        }
+    }
+
+    # --- Komponentkode i navn ---
+    $kompLetters = $null
+    if ($p.KompCode) {
+        if ($p.KompCode -match '^([A-Za-z]{2,3})\d{0,3}$') {
+            $kompLetters = $Matches[1].ToUpper()
+            if (-not $data.PA0802.ContainsKey($kompLetters)) {
+                $status="FEIL"; $err.Append("Ukjent komponentkode '-$kompLetters'. ") | Out-Null
+            }
+        }
+    }
+
+    # --- Automatisk deteksjon ---
+    $det = Detect-ComponentByAliases -fileBase $base -aliasMap $data.PA0802Aliases
+    if (-not $p.KompCode -and $det.Matches.Count -gt 1) {
+        $status="FEIL"; $err.Append("Flere mulige komponenter: $($det.Matches -join ', '). ") | Out-Null
+    }
+
+    # --- Produktinformasjon krever -XX ---
+    if ($p.InfoType -and $p.InfoType -ieq "Produktinformasjon" -and -not $kompLetters) {
+        $status="FEIL"; $err.Append("Produktinformasjon krever -XX[NNN]. ") | Out-Null
+    }
+
+    # --- Forslag ---
+    if ($p.System -and $p.Lopenr -and $p.InfoType -and $p.DokType) {
+        $new = "{0}.{1}" -f $p.System, $p.Lopenr
+        if ($p.KompCode)       { $new += "-$($p.KompCode)" }
+        elseif ($det.Unique)   { $new += "-$($det.Unique)" }
+        $new += " $($p.InfoType) $($p.DokType)"
+        if ($p.Fritekst) { $new += " $($p.Fritekst)" }
+        $new += ".$ext"
+    }
+    else { $new = "MANUELL VURDERING NØDVENDIG" }
+
+    return [PSCustomObject]@{
+        Filnavn=$File.Name
+        Status =$status
+        Feil   =$err.ToString().Trim()
+        ForslagTilKorreksjon=$new
+    }
+}
+
+#############################################
+### 5 — GUI
+#############################################
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "FDVU Validator V7.5 Reboot"
+$form.Size = "850,650"
+$form.StartPosition = "CenterScreen"
+
+$lblFolder = New-Object System.Windows.Forms.Label
+$lblFolder.Text = "Velg mappe:"
+$lblFolder.Location = "20,20"
+$form.Controls.Add($lblFolder)
+
+$txtFolder = New-Object System.Windows.Forms.TextBox
+$txtFolder.Location = "20,45"
+$txtFolder.Size = "700,25"
+$form.Controls.Add($txtFolder)
+
+$btnBrowseFolder = New-Object System.Windows.Forms.Button
+$btnBrowseFolder.Text = "..."
+$btnBrowseFolder.Location = "730,45"
+$btnBrowseFolder.Size = "40,25"
+$form.Controls.Add($btnBrowseFolder)
+
+$lblCsv = New-Object System.Windows.Forms.Label
+$lblCsv.Text = "Kodeliste CSV:"
+$lblCsv.Location = "20,80"
+$form.Controls.Add($lblCsv)
+
+$txtCsv = New-Object System.Windows.Forms.TextBox
+$txtCsv.Location = "20,105"
+$txtCsv.Size = "700,25"
+$form.Controls.Add($txtCsv)
+
+$btnBrowseCsv = New-Object System.Windows.Forms.Button
+$btnBrowseCsv.Text = "..."
+$btnBrowseCsv.Location = "730,105"
+$btnBrowseCsv.Size = "40,25"
+$form.Controls.Add($btnBrowseCsv)
+
+$chkEnforcePairs = New-Object System.Windows.Forms.CheckBox
+$chkEnforcePairs.Text = "Sjekk InfoType–DokType-par"
+$chkEnforcePairs.Checked = $true
+$chkEnforcePairs.Location = "20,140"
+$form.Controls.Add($chkEnforcePairs)
+
+$chkIncludeXlsx = New-Object System.Windows.Forms.CheckBox
+$chkIncludeXlsx.Text = "Inkluder .xlsx"
+$chkIncludeXlsx.Location = "20,165"
+$form.Controls.Add($chkIncludeXlsx)
+
+$chkLooseSystem = New-Object System.Windows.Forms.CheckBox
+$chkLooseSystem.Text = "Tillat 200–799 som system"
+$chkLooseSystem.Checked = $true
+$chkLooseSystem.Location = "20,190"
+$form.Controls.Add($chkLooseSystem)
+
+$btnRun = New-Object System.Windows.Forms.Button
+$btnRun.Text = "Kjør"
+$btnRun.Location = "20,225"
+$btnRun.Size = "120,35"
+$form.Controls.Add($btnRun)
+
+$btnOpenReport = New-Object System.Windows.Forms.Button
+$btnOpenReport.Text = "Åpne rapport"
+$btnOpenReport.Enabled = $false
+$btnOpenReport.Location = "160,225"
+$btnOpenReport.Size = "150,35"
+$form.Controls.Add($btnOpenReport)
+
+$output = New-Object System.Windows.Forms.TextBox
+$output.Multiline = $true
+$output.ScrollBars = "Vertical"
+$output.Location = "20,270"
+$output.Size = "780,330"
+$output.ReadOnly = $true
+$form.Controls.Add($output)
+
+function Append-Output($t) {
+    $output.AppendText($t + [Environment]::NewLine)
+}
+
+#############################################
+### 6 — EVENT HANDLERS
+#############################################
+
+$btnBrowseFolder.Add_Click({
+    $dlg = New-Object    System.Windows.Forms.FolderBrowserDialog
+    if ($dlg.ShowDialog() -eq "OK") {
+        $txtFolder.Text = $dlg.SelectedPath
+        $autoCsv = Join-Path $dlg.SelectedPath "kodeliste.csv"
+        if (Test-Path $autoCsv) { $txtCsv.Text = $autoCsv }
+    }
+})
+
+$btnBrowseCsv.Add_Click({
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Filter = "CSV (*.csv)|*.csv"
+    if ($dlg.ShowDialog() -eq "OK") { $txtCsv.Text = $dlg.FileName }
+})
+
+$btnRun.Add_Click({
+    $output.Clear()
+
+    $folder = $txtFolder.Text.Trim()
+    $csv = $txtCsv.Text.Trim()
+    $enforcePairs = $chkEnforcePairs.Checked
+    $includeXlsx = $chkIncludeXlsx.Checked
+    $looseSystem = $chkLooseSystem.Checked
+
+    if (-not (Test-Path $folder)) {
+        [System.Windows.Forms.MessageBox]::Show("Mappen finnes ikke.")
+        return
+    }
+    if (-not (Test-Path $csv)) {
+        [System.Windows.Forms.MessageBox]::Show("CSV ikke funnet.")
+        return
+    }
+
+    try {
+        Append-Output "Laster kodelister…"
+        $data = Load-FdvuData -CsvPath $csv
+        Append-Output ("Systemer:     {0}" -f $data.PA0702.Count)
+        Append-Output ("Komponenter:  {0}" -f $data.PA0802.Count)
+        Append-Output ("InfoTyper:    {0}" -f $data.InfoTypes.Count)
+        Append-Output ("DokTyper:     {0}" -f $data.DocTypes.Count)
+        Append-Output ("Par:          {0}" -f $data.Pairs.Count)
+        Append-Output ""
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show("Feil ved lesing av CSV:`n" + $_.Exception.Message)
+        return
+    }
+
+    # Finn filer
+    $files = Get-ChildItem -File -LiteralPath $folder
+    if (-not $includeXlsx) {
+        $files = $files | ? { $_.Extension -notin @(".csv",".xlsx") }
+    } else {
+        $files = $files | ? { $_.Extension -ne ".csv" }
+    }
+
+    Append-Output ("Validerer {0} filer…" -f $files.Count)
+
+    $results = foreach ($f in $files) {
+        $r = Validate-File -File $f -data $data -enforcePairs:$enforcePairs -looseSystem:$looseSystem
+        if ($r.Status -eq "OK") {
+            Append-Output ("OK   : {0}" -f $f.Name)
+        } else {
+            Append-Output ("FEIL : {0} | {1}" -f $f.Name, $r.Feil)
+            if ($r.ForslagTilKorreksjon -and $r.ForslagTilKorreksjon -ne "MANUELL VURDERING NØDVENDIG") {
+                Append-Output ("      Forslag: {0}" -f $r.ForslagTilKorreksjon)
+            }
+        }
+        $r
+    }
+
+    $csvOut = Join-Path $folder "fdvu-validering.csv"
+    $results | Export-Csv $csvOut -Encoding UTF8 -NoTypeInformation
+
+    Append-Output ""
+    Append-Output "Rapport generert: $csvOut"
+    $btnOpenReport.Enabled = $true
+    $global:lastReport = $csvOut
+})
+
+$btnOpenReport.Add_Click({
+    if ($global:lastReport -and (Test-Path $global:lastReport)) {
+        Start-Process $global:lastReport
+    }
+})
+
+#############################################
+### 7 — START GUI
+#############################################
+
+$form.ShowDialog() | Out-Null# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+
+      # Runs a single command using the runners shell
+      - name: Run a one-line script
+        run: echo Hello, world!
+
+      # Runs a set of commands using the runners shell
+      - name: Run a multi-line script
+        run: |
+          echo Add other actions to build,
+          echo test, and deploy your project.
